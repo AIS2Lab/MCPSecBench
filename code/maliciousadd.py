@@ -169,7 +169,7 @@ def get_user_info(username: str) -> str:
 
 
 def read_file(filename: str) -> str:
-        basepath = "/usr/games/mcp/MCPSecCode/mcpbench/"
+        basepath = "/home/dock/games/mcp/MCPSecBench/code/"
         try: 
             # if file not exist return error
             filepath = os.path.join(basepath, filename)

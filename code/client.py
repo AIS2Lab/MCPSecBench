@@ -4,9 +4,11 @@ import logging
 import sys
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 import subprocess
 import os
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 from enum import Enum
 import anthropic
 from anthropic import Anthropic
@@ -22,6 +24,9 @@ class ServerType(Enum):
     LOCAL = "local"
     SSE = "sse"
     HTTP = "http"
+    HTTPS = "https"
+
+cost = 0
 
 @dataclass
 class MCPServerConfig:
@@ -131,7 +136,9 @@ class MCPServerConnection:
             message.id = str(self.message_id)
             
         # Send message
-        msg_str = json.dumps(asdict(message), separators=(',', ':'))
+        cleaned = asdict(message).copy()
+        cleaned = {k: v for k, v in cleaned.items() if v != None}
+        msg_str = json.dumps(cleaned, separators=(',', ':'))
         self.process.stdin.write(f"{msg_str}\n".encode())
         await self.process.stdin.drain()
         
@@ -442,6 +449,272 @@ class HTTPMCPConnection:
             logger.info(f"Stopped MCP server: {self.config.name}")
 
 
+class HTTPSMCPConnection:
+    """HTTPS MCP server connection"""
+    
+    def __init__(self, config: MCPServerConfig):
+        self.config = config
+        self.process = None
+        self.initialized = False
+        self.tools = {}
+        self.resources = {}
+        self.message_id = 0
+        self.session = None
+        self.base_url = self.config.url
+        
+    async def start(self):
+        """Start the HTTP session"""
+        try:
+            self.config.ssl_verify = True
+            headers = self.config.headers or {}
+            if self.config.auth_token:
+                headers[self.config.auth_header] = f"Bearer {self.config.auth_token}"
+            elif self.config.api_key:
+                headers["X-API-Key"] = self.config.api_key
+            
+            connector = aiohttp.TCPConnector(
+                ssl=self.config.ssl_verify,
+                limit=100,
+                limit_per_host=30
+            )
+            
+            timeout = aiohttp.ClientTimeout(total=self.config.timeout)
+            self.session = aiohttp.ClientSession(
+                headers=headers,
+                connector=connector,
+                timeout=timeout
+            )
+            
+            self.connected = True
+            await self.initialize()
+            logger.info(f"Connected to HTTP MCP server: {self.config.name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to HTTP MCP server {self.config.name}: {e}")
+            raise
+    
+    async def initialize(self):
+        """Initialize the MCP server connection"""
+        # Send initialization message
+        init_msg = MCPMessage(
+            id=str(self.message_id),
+            method="initialize",
+            params={
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "resources": {}
+                },
+                "clientInfo": {
+                    "name": "multi-mcp-client",
+                    "version": "1.0.0"
+                }
+            }
+        )
+        
+        response = await self.send_message(init_msg)
+        if response and not response.error:
+            self.initialized = True
+            
+            # Send initialized notification
+            initialized_msg = MCPMessage(method="notifications/initialized")
+            await self.send_message(initialized_msg)
+            
+            # List available tools and resources
+            await self.list_tools()
+            await self.list_resources()
+        else:
+            raise Exception(f"Failed to initialize server {self.config.name}")
+
+    async def send_message(self, message: MCPMessage) -> Optional[MCPMessage]:
+        """Send a message via HTTP POST"""
+        if not self.session or not self.connected:
+            raise Exception("HTTP session not started")
+            
+        if message.id is None and message.method != "notifications/initialized":
+            self.message_id += 1
+            message.id = str(self.message_id)
+        
+        # Map MCP methods to HTTP endpoints
+        endpoint_map = {
+            "initialize": "/initialize",
+            "tools/list": "/tools",
+            "tools/call": "/tools/call",
+            "resources/list": "/resources",
+            "resources/read": "/resources/read",
+            "notifications/initialized": "/notifications/initialized"
+        }
+        
+        endpoint = endpoint_map.get(message.method, f"/{message.method}")
+        url = f"{self.base_url.rstrip('/')}{endpoint}"
+        
+        try:
+            async with self.session.post(url, json=asdict(message), headers=self.config.headers) as response:
+                if response.status == 200 and response.content_type == "application/json":
+                    data = await response.json()
+                    # logger.info(f"data json: {data}")
+                    return MCPMessage(**data)
+                elif response.status == 200 and response.content_type == "text/event-stream":
+                    data = await response.text()
+                    # logger.info(f"response: {response}")
+                    self.config.session_id = response.headers['mcp-session-id']
+                    self.config.headers["mcp-session-id"] = self.config.session_id
+                    # logger.info(f"data: {data}")
+                    # response_data = json.loads(data.strip())
+                    # logger.info(f"response: {response_data}")
+                    return MCPMessage(data)
+                elif response.status == 202:
+                    data = await response.text()
+                    return data
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"HTTP error {response.status}: {error_text}")
+        except Exception as e:
+            logger.error(f"HTTP request error for {self.config.name}: {e}")
+            raise
+
+    async def list_tools(self):
+        """List available tools from the server"""
+        msg = MCPMessage(method="tools/list")
+        response = await self.send_message(msg)
+        if response and response.result:
+            self.tools = {tool['name']: tool for tool in response.result.get('tools', [])}
+            logger.info(f"Server {self.config.name} has {len(self.tools)} tools")
+    
+    async def list_resources(self):
+        """List available resources from the server"""
+        msg = MCPMessage(method="resources/list")
+        response = await self.send_message(msg)
+        if response and response.result:
+            self.resources = {res['uri']: res for res in response.result.get('resources', [])}
+            logger.info(f"Server {self.config.name} has {len(self.resources)} resources")
+    
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Call a tool on the server"""
+        if tool_name not in self.tools:
+            raise Exception(f"Tool {tool_name} not found on server {self.config.name}")
+            
+        msg = MCPMessage(
+            method="tools/call",
+            params={
+                "name": tool_name,
+                "arguments": arguments
+            }
+        )
+        
+        response = await self.send_message(msg)
+        if response and response.result:
+            return response.result
+        elif response and response.error:
+            raise Exception(f"Tool call failed: {response.error}")
+        else:
+            raise Exception("No response from tool call")
+
+
+    async def call_tool_openai(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Call a tool on the server"""
+        if tool_name not in self.tools:
+            raise Exception(f"Tool {tool_name} not found on server {self.config.name}")
+            
+        msg = MCPMessage(
+            method="tools/call",
+            params={
+                "id": self.message_id,
+                "name": tool_name,
+                "arguments": arguments
+            }
+        )
+        self.message_id += 1
+        
+        response = await self.send_message(msg)
+        if response and response.result:
+            return response.result
+        elif response and response.error:
+            raise Exception(f"Tool call failed: {response.error}")
+        else:
+            raise Exception("No response from tool call")
+    
+    async def read_resource(self, uri: str) -> Any:
+        """Read a resource from the server"""
+        if uri not in self.resources:
+            raise Exception(f"Resource {uri} not found on server {self.config.name}")
+            
+        msg = MCPMessage(
+            method="resources/read",
+            params={"uri": uri}
+        )
+        
+        response = await self.send_message(msg)
+        if response and response.result:
+            return response.result
+        elif response and response.error:
+            raise Exception(f"Resource read failed: {response.error}")
+        else:
+            raise Exception("No response from resource read")
+    
+    async def stop(self):
+        """Stop the MCP server"""
+        if self.process:
+            self.process.terminate()
+            await self.process.wait()
+            logger.info(f"Stopped MCP server: {self.config.name}")
+
+def tool_to_dict(tool):
+    """Convert Tool object to dictionary format"""
+    return {
+        'name': tool.name,
+        'description': tool.description,
+        'inputSchema': tool.inputSchema
+    }
+
+class SSEMCPConnect:
+    """MCP Client with SSE connection support"""
+    def __init__(self, server_url):
+        # Initialize session and client objects
+        self.session: Optional[ClientSession] = None
+        self.exit_stack = AsyncExitStack()
+        self.anthropic = Anthropic()
+        self.server_url = server_url
+        self.tools = {}
+        self.message_id = 0
+
+    async def start(self):
+        """Connect to an MCP server running with SSE transport"""
+        # Store the context managers so they stay alive
+        self._streams_context = sse_client(url=self.server_url)
+        streams = await self._streams_context.__aenter__()
+
+        self._session_context = ClientSession(*streams)
+        self.session: ClientSession = await self._session_context.__aenter__()
+
+        # Initialize
+        await self.session.initialize()
+
+        # List available tools to verify connection
+        print("Initialized SSE client...")
+        print("Listing tools...")
+        response = await self.session.list_tools()
+        self.tools = {tool.name: tool_to_dict(tool) for tool in response.tools}
+        print("\nConnected to server with tools:", [tool.name for tool in response.tools])
+
+    async def stop(self):
+        """Properly clean up the session and streams"""
+        if self._session_context:
+            await self._session_context.__aexit__(None, None, None)
+        if self._streams_context:
+            await self._streams_context.__aexit__(None, None, None)
+
+    async def call_tool_openai(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Call a tool on the server"""
+        result = await self.session.call_tool(tool_name, arguments)
+        return result
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Call a tool on the server"""
+        result = await self.session.call_tool(tool_name, arguments)
+        return result
+
+
 class MultiMCPClient:
     """Client that manages multiple MCP server connections"""
     
@@ -463,6 +736,10 @@ class MultiMCPClient:
             server = MCPServerConnection(config)
         elif config.server_type == ServerType.HTTP:
             server = HTTPMCPConnection(config)
+        elif config.server_type == ServerType.HTTPS:
+            server = HTTPSMCPConnection(config)
+        elif config.server_type == ServerType.SSE:
+            server = SSEMCPConnect(config.url)
         await server.start()
         self.servers[config.name] = server
         logger.info(f"Added server: {config.name}")
@@ -552,6 +829,7 @@ class MultiMCPClient:
         return tools
     
     async def chat_with_openai(self, message: str, max_turns: int = 5) -> str:
+        global cost
         tools = self.format_tools_for_openai()
         messages = [{"role": "user", "content": message}]
         for turn in range(max_turns):
@@ -562,7 +840,8 @@ class MultiMCPClient:
                     tools=tools if tools else None,
                     tool_choice="auto" if tools else None
                 )
-                
+                cost += response.usage.total_tokens
+                print(f"Total tokens: {response.usage.total_tokens}")
                 message = response.choices[0].message
                 messages.append({
                     "role": "assistant",
@@ -577,7 +856,14 @@ class MultiMCPClient:
                             
                             # Call the MCP tool
                             result = await self.call_tool(function_name, function_args)
-                            
+                            if hasattr(result, 'content') and isinstance(result.content, list):
+                                text_parts = []
+                                for part in result.content:
+                                    if hasattr(part, 'text'):
+                                        text_parts.append(part.text)
+                                    else:
+                                        text_parts.append(str(part))
+                                result = "\n".join(text_parts)
                             # Add tool result to conversation
                             messages.append({
                                 "role": "tool",
@@ -773,6 +1059,7 @@ class MultiMCPClient:
     async def chat_with_claude(self, message: str, max_tokens: int = 1024) -> str:
         """Chat with Claude using available MCP tools"""
         tools = self.format_tools_for_claude()
+        global cost
         
         # logger.info(f"tools: {tools}")
 
@@ -781,11 +1068,14 @@ class MultiMCPClient:
         # Initial request to Claude
         try:
             response = self.anthropic_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-opus-4-5-20251101",
                 max_tokens=1000,
                 messages=messages,
                 tools=tools if tools else None
             )
+            cost += response.usage.input_tokens + response.usage.output_tokens
+            print(f"Input Tokens: {response.usage.input_tokens}")
+            print(f"Output Tokens: {response.usage.output_tokens}")
         except anthropic.APIConnectionError as e:
             logger.error(f"Connection error: {e}")
             raise
@@ -796,7 +1086,6 @@ class MultiMCPClient:
         except anthropic.APIError as e:
             logger.error(f"API error: {e}")
             raise
-        
         # Handle tool calls
         while response.stop_reason == "tool_use":
             # logger.info(f"content: {response.content}")
@@ -828,11 +1117,14 @@ class MultiMCPClient:
             messages.append({"role": "user", "content": tool_results})
             
             response = self.anthropic_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-opus-4-5-20251101",
                 max_tokens=1000,
                 messages=messages,
                 tools=tools if tools else None
             )
+            cost += response.usage.input_tokens + response.usage.output_tokens
+            print(f"Input Tokens: {response.usage.input_tokens}")
+            print(f"Output Tokens: {response.usage.output_tokens}")
         
         # Extract text response
         text_content = ""
@@ -846,7 +1138,7 @@ class MultiMCPClient:
         """Start an interactive chat session"""
         print("Type 'quit' to exit, 'tools' to list available tools, 'resources' to list resources")
         print("-" * 50)
-        
+        global cost
         while True:
             try:
                 user_input = input("\nUser Input: ").strip()
@@ -885,6 +1177,7 @@ class MultiMCPClient:
                     print("\nLlama: ", end="", flush=True)
                     response = await self.chat_with_llama(user_input)
                 print(response)
+                print("Total cost: " + str(cost))
                 
             except KeyboardInterrupt:
                 print("\nExiting...")
@@ -936,23 +1229,30 @@ async def main():
             name="signature-checkers",
             server_type=ServerType.LOCAL,
             command=["uv"],
-            args=["--directory", "/usr/games/mcp/MCPSecCode/mcpbench", "run", "./squatting.py"],
+            args=["--directory", "/home/dock/games/mcp/MCPSecBench/code", "run", "./squatting.py"],
             description="Check file's signature"
         ),
         MCPServerConfig(
             name="compute-helper",
             server_type=ServerType.LOCAL,
             command=["uv"],
-            args=["--directory", "/usr/games/mcp/MCPSecCode/mcpbench", "run", "addserver.py"],
+            args=["--directory", "/home/dock/games/mcp/MCPSecBench/code", "run", "addserver.py"],
             description="Basic computer"
         ),
         MCPServerConfig(
             name="compute-assistant",
             server_type=ServerType.LOCAL,
             command=["uv"],
-            args=["--directory", "/usr/games/mcp/MCPSecCode/mcpbench", "run", "./maliciousadd.py"],
+            args=["--directory", "/home/dock/games/mcp/MCPSecBench/code", "run", "./maliciousadd.py"],
             description="Enhanced computer"
         ),
+        #MCPServerConfig(
+        #    name="AIM-MCP",
+        #    server_type=ServerType.LOCAL,
+        #    command=["npx"],
+        #    args=["aim-guard-mcp"],
+        #    description="Guard and Protect your MCPs & AI Agents"
+        #),
         MCPServerConfig(
             name="signature-checker",
             server_type=ServerType.HTTP,
@@ -961,11 +1261,19 @@ async def main():
             api_key="",
             description="Check file's signature"
         ),
+        MCPServerConfig(
+            name="MCIP-Guardian",
+            server_type=ServerType.SSE,
+            url="http://127.0.0.1:8000/sse",
+            headers={"accept": "application/json, text/event-stream"},
+            api_key="",
+            description="Protecting MCP Safety"
+        ),
         MCPServerConfig( 
             name="schema",
             server_type=ServerType.LOCAL,
             command=["uv"],
-            args=["--directory", "/usr/games/mcp/MCPSecCode/mcpbench", "run", "mcp", "run", "./squatting.py"],
+            args=["--directory", "/home/dock/games/mcp/MCPSecBench/code", "run", "mcp", "run", "./squatting.py"],
             description="Enhanced computer"
         ),
         # Add more servers as needed
